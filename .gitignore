@@ -1,0 +1,22 @@
+# secrets
+.env
+
+# data store (생성물)
+data_store/
+*.parquet
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# node / frontend
+node_modules/
+frontend/dist/
+frontend/node_modules/
+
+# os
+.DS_Store
