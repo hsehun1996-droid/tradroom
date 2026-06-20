@@ -36,14 +36,18 @@ def fetch_live_market_data(
     s, e = start.replace("-", ""), end.replace("-", "")
 
     # --- 유니버스: 시총 상위 N (KOSPI) ---
+    cap = stock.get_market_cap_by_ticker(e, market="KOSPI")
     if tickers is None:
-        cap = stock.get_market_cap_by_ticker(e, market="KOSPI")
         tickers = cap.sort_values("시가총액", ascending=False).head(universe_size).index.tolist()
     log.info("라이브 유니버스 %d 종목 적재", len(tickers))
+
+    # --- 섹터 매핑 (KRX 업종지수 구성종목 기준) ---
+    sector_map, sector_index_raw = _build_sectors(stock, s, e, tickers)
 
     # --- 가격 패널 ---
     o, h, l, c, v, val, flow = ({} for _ in range(7))
     meta_rows = []
+    managed = _flagged_tickers(stock, e)
     for tkr in tickers:
         try:
             df = stock.get_market_ohlcv(s, e, tkr)
@@ -57,10 +61,10 @@ def fetch_live_market_data(
                 flow[tkr] = fdf.get("외국인합계", 0) + fdf.get("기관합계", 0)
             except Exception:
                 flow[tkr] = pd.Series(0.0, index=df.index)
-            name = stock.get_market_ticker_name(tkr)
             meta_rows.append(
-                {"ticker": tkr, "name": name, "sector": _sector_for(stock, tkr),
-                 "is_managed": False, "is_halted": False, "is_capital_impaired": False}
+                {"ticker": tkr, "name": stock.get_market_ticker_name(tkr),
+                 "sector": sector_map.get(tkr, "기타"),
+                 "is_managed": tkr in managed, "is_halted": False, "is_capital_impaired": False}
             )
         except Exception as exc:
             log.debug("종목 %s 적재 실패: %s", tkr, exc)
@@ -72,32 +76,73 @@ def fetch_live_market_data(
     wide = lambda d: pd.DataFrame(d).reindex(idx)
     meta = pd.DataFrame(meta_rows).set_index("ticker")
 
-    # --- 매크로 (FDR + FRED) ---
-    macro, sector_index = _build_macro_and_sectors(start, end, idx, meta)
+    close_panel = wide(c)
 
-    # --- 재무 (DART; best-effort, point-in-time) ---
-    financials = _build_financials(tickers, idx)
+    # --- 매크로 (ECOS + FDR + FRED) ---
+    macro, sector_index = _build_macro_and_sectors(start, end, idx, meta, sector_index_raw)
+
+    # --- 재무 (DART, point-in-time) + 시총 결합 PER/PBR ---
+    shares = _shares_outstanding(cap, close_panel, e)   # 종목별 상장주식수(근사)
+    financials = _build_financials(list(close_panel.columns), idx, close_panel, shares)
 
     return MarketData(
-        open=wide(o), high=wide(h), low=wide(l), close=wide(c),
+        open=wide(o), high=wide(h), low=wide(l), close=close_panel,
         volume=wide(v), value=wide(val), net_flow=wide(flow).fillna(0.0),
         financials=financials, meta=meta, macro=macro, sector_index=sector_index,
     )
 
 
-def _sector_for(stock, tkr: str) -> str:
+def _shares_outstanding(cap: pd.DataFrame, close_panel: pd.DataFrame, end_yyyymmdd: str) -> pd.Series:
+    """상장주식수 ≈ 시가총액 / 종가(말일).  pykrx cap 의 '상장주식수' 우선."""
+    if "상장주식수" in cap.columns:
+        return cap["상장주식수"].reindex(close_panel.columns)
+    last_close = close_panel.ffill().iloc[-1]
+    mcap = cap["시가총액"].reindex(close_panel.columns)
+    return (mcap / last_close).replace([float("inf")], float("nan"))
+
+
+def _build_sectors(stock, s: str, e: str, tickers: list[str]):
+    """KRX KOSPI 업종지수 구성종목으로 ticker→섹터 매핑 + 섹터지수 시계열."""
+    sector_map: dict[str, str] = {}
+    sector_index_raw: dict[str, pd.Series] = {}
+    tset = set(tickers)
     try:
-        return stock.get_market_ticker_name(tkr) and _industry_guess(stock, tkr)
-    except Exception:
-        return "기타"
+        for idx_code in stock.get_index_ticker_list(date=e, market="KOSPI"):
+            name = stock.get_index_ticker_name(idx_code)
+            # 대표지수(코스피, 코스피200 등) 제외 — 업종지수만
+            if any(k in name for k in ("코스피", "KRX", "200", "100", "50", "배당", "섹터")):
+                if name not in ("코스피",):
+                    pass
+            try:
+                members = stock.get_index_portfolio_deposit_file(idx_code)
+            except Exception:
+                members = []
+            hit = tset.intersection(members)
+            if not hit:
+                continue
+            for tkr in hit:
+                sector_map.setdefault(tkr, name)
+            try:
+                oh = stock.get_index_ohlcv(s, e, idx_code)
+                sector_index_raw[name] = oh["종가"]
+            except Exception:
+                pass
+    except Exception as exc:
+        log.warning("KRX 업종 분류 실패(전부 '기타' 처리): %s", exc)
+    return sector_map, sector_index_raw
 
 
-def _industry_guess(stock, tkr: str) -> str:
-    # pykrx 는 업종 직접 제공이 제한적 → KRX 섹터지수 매핑은 단순화.
-    return "기타"
+def _flagged_tickers(stock, e: str) -> set[str]:
+    """관리종목/거래정지 등 지뢰 목록.
+
+    pykrx 는 관리종목 목록을 직접 제공하지 않는다.  KRX 정보데이터시스템
+    또는 DART 의 관리종목 공시로 보강하는 확장 지점.  현재는 빈 집합
+    (게이트의 다른 조건으로 1차 방어).
+    """
+    return set()
 
 
-def _build_macro_and_sectors(start, end, idx, meta):
+def _build_macro_and_sectors(start, end, idx, meta, sector_index_raw=None):
     macro = pd.DataFrame(index=idx)
     try:
         import FinanceDataReader as fdr
@@ -109,6 +154,19 @@ def _build_macro_and_sectors(start, end, idx, meta):
         macro["kospi_close"] = np.nan
         macro["usdkrw"] = np.nan
 
+    # ECOS 환율로 보강(있으면 우선) + 한국 금리
+    try:
+        from tradroom.data import ecos
+
+        ek = ecos.fetch_macro(start, end, idx)
+        if "usdkrw" in ek and ek["usdkrw"].notna().any():
+            macro["usdkrw"] = ek["usdkrw"].fillna(macro["usdkrw"])
+        for col in ("base_rate", "ktb3y"):
+            if col in ek:
+                macro[col] = ek[col]
+    except Exception as exc:
+        log.warning("ECOS 매크로 실패: %s", exc)
+
     # VKOSPI 대용: KOSPI 변동성
     ret = macro["kospi_close"].pct_change()
     macro["vkospi"] = (ret.rolling(20).std() * np.sqrt(252) * 100).fillna(20)
@@ -119,11 +177,15 @@ def _build_macro_and_sectors(start, end, idx, meta):
 
     macro["foreign_net"] = 0.0  # 종목 net_flow 합으로 대체 가능
 
-    # 섹터 지수: 우리 메타 섹터별 동일가중 (단순). 라이브에서 섹터 분류가 약하면 KOSPI 추종.
+    # 섹터 지수: KRX 업종지수 실데이터 우선, 없으면 KOSPI 추종 폴백.
     sectors = sorted(meta["sector"].dropna().unique().tolist()) or ["기타"]
-    sector_index = pd.DataFrame(
-        {sec: macro["kospi_close"].ffill() for sec in sectors}, index=idx
-    )
+    cols = {}
+    for sec in sectors:
+        if sector_index_raw and sec in sector_index_raw:
+            cols[sec] = sector_index_raw[sec].reindex(idx).ffill()
+        else:
+            cols[sec] = macro["kospi_close"].ffill()
+    sector_index = pd.DataFrame(cols, index=idx)
     return macro, sector_index
 
 
@@ -155,20 +217,26 @@ def _to_float(x):
         return np.nan
 
 
-def _build_financials(tickers, idx) -> dict[str, pd.DataFrame]:
-    """DART 재무 — best-effort.  키 없으면 빈(NaN) 패널 반환."""
-    metrics = ["roe", "op_margin", "debt_ratio", "eps_yoy", "revenue_yoy", "per", "pbr"]
-    empty = {m: pd.DataFrame(index=idx, columns=tickers, dtype=float) for m in metrics}
-    if not SETTINGS.dart_api_key:
-        log.info("DART_API_KEY 없음 → 재무 패널은 비움(추세/수급 위주로 동작).")
-        return empty
-    try:
-        # OpenDartReader 로 핵심 재무를 가져오는 자리.
-        # 종목/연도별 호출이 많아 비용이 큼 → MVP 에서는 골격만 두고 확장.
-        import OpenDartReader  # noqa: F401
+def _build_financials(tickers, idx, close_panel, shares) -> dict[str, pd.DataFrame]:
+    """DART 재무(point-in-time) + 시총 결합 PER/PBR.
 
-        log.info("DART 연결됨 — 재무 수집은 확장 지점(현재 골격). 빈 패널 반환.")
-        return empty
-    except Exception as exc:
-        log.warning("DART 초기화 실패: %s", exc)
-        return empty
+    PER = 시가총액 / 순이익,  PBR = 시가총액 / 자본총계.  시가총액 = 종가 × 상장주식수.
+    순이익/자본총계는 접수일 이후에만 채워진 point-in-time 패널이므로 PER/PBR 도 PIT.
+    """
+    from tradroom.data import dart
+
+    fin = dart.build_financials(list(tickers), idx)
+
+    # 시가총액 패널 (PIT 가격 × 상장주식수 근사)
+    mcap = close_panel.mul(shares.reindex(close_panel.columns), axis=1)
+    ni = fin.get("net_income")
+    eq = fin.get("equity")
+    if ni is not None and ni.notna().any().any():
+        fin["per"] = (mcap / ni.replace(0, np.nan)).where(ni > 0)
+    else:
+        fin["per"] = pd.DataFrame(index=idx, columns=close_panel.columns, dtype=float)
+    if eq is not None and eq.notna().any().any():
+        fin["pbr"] = mcap / eq.replace(0, np.nan)
+    else:
+        fin["pbr"] = pd.DataFrame(index=idx, columns=close_panel.columns, dtype=float)
+    return fin

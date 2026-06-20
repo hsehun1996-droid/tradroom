@@ -74,14 +74,32 @@ npm run dev      # http://localhost:5173 (API 8000 으로 프록시)
 ### 3) 실제 무료 데이터 연동 (선택)
 
 ```bash
-cp .env.example .env      # DART/ECOS/FRED 키 입력 (없어도 일부만 채워짐)
+cp .env.example .env      # DART/ECOS/FRED/KIS 키 입력
 # .env 에서 TRADROOM_USE_LIVE_DATA=true
 pip install -e ".[live]"
+
+PYTHONPATH=. python scripts/check_live.py                       # 키·연결 진단(권장 먼저)
 PYTHONPATH=. python scripts/run_ingest.py --source live --start 2021-01-01
 ```
 
-데이터 소스(블루프린트 3장): **KIS / KRX(pykrx) / DART / ECOS / FRED**.
-키·네트워크가 없거나 일부 실패하면 자동으로 샘플 데이터로 폴백합니다.
+데이터 소스(블루프린트 3장)와 어댑터:
+
+| 소스 | 인증 | 모듈 | 제공 |
+|---|---|---|---|
+| KRX (pykrx) | 없음 | `data/live.py` | 시세·거래대금·투자자별 수급·업종분류 |
+| FinanceDataReader | 없음 | `data/live.py` | KOSPI 지수·USD/KRW |
+| DART | API Key | `data/dart.py` | 재무제표 → **접수일 기준 point-in-time** 패널 + PER/PBR(시총 결합) |
+| ECOS (한국은행) | API Key | `data/ecos.py` | 환율·기준금리·국고채 |
+| FRED | API Key | `data/live.py` | 미 하이일드 스프레드·DXY·10년물 |
+| KIS (한국투자증권) | App Key+Secret(OAuth) | `data/kis.py` | 토큰 + 현재가/일별시세 (**읽기 전용, 주문 없음**) |
+
+> **인증 처리 원칙**: 키는 `.env`(환경변수)에서만 읽고 코드·깃에 절대 넣지 않습니다(`.env`는 `.gitignore`).
+> 키가 없거나 일부 소스가 실패해도 *얻은 만큼* 채우고 나머지는 결측/샘플로 **우아하게 폴백**합니다.
+>
+> **Claude Code on the web 사용 시**: 외부 호스트가 egress 허용목록에 없으면 `403 Host not in allowlist`로 막힙니다.
+> 환경 설정의 network/egress 에 `data.krx.co.kr`, `opendart.fss.or.kr`, `ecos.bok.or.kr`,
+> `api.stlouisfed.org`, `finance.naver.com`, `openapi.koreainvestment.com` 등을 추가하세요.
+> ECOS 통계코드(STAT_CODE)는 시점에 따라 바뀔 수 있어 `data/ecos.py`의 `DEFAULTS`를 실행 전 재확인 권장.
 
 ---
 
